@@ -42,7 +42,7 @@ jobs:
           skip-dirs: 'node_modules,dist,build,.venv,venv,vendor,.next,.git,Examples'
 
       - name: File or update Trivy findings issue
-        if: github.event_name != 'pull_request' && (github.ref_name == github.event.repository.default_branch || github.ref_name == 'marfi/hexclave-pilot')
+        if: github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
