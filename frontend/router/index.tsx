@@ -37,6 +37,7 @@ import LogoutPage from "pages/LogoutPage";
 import MDMAppleSSOCallbackPage from "pages/MDMAppleSSOCallbackPage";
 import MDMAppleSSOPage from "pages/MDMAppleSSOPage";
 import MfaPage from "pages/MfaPage";
+import EmailLoginPage from "pages/EmailLoginPage/EmailLoginPage";
 import NoAccessPage from "pages/NoAccessPage";
 import RegistrationPage from "pages/RegistrationPage";
 import ResetPasswordPage from "pages/ResetPasswordPage";
@@ -482,6 +483,7 @@ const routes = (
             component={ConfirmSSOInvitePage}
           />
           <Route path="login/mfa/:token" component={MfaPage} />
+          <Route path="login/email" component={EmailLoginPage} />
           <Route path="login/forgot" component={ForgotPasswordPage} />
           <Route path="login/reset" component={ResetPasswordPage} />
           <Route path="login/denied" component={NoAccessPage} />

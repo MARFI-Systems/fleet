@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 
 	"github.com/fleetdm/fleet/v4/server"
 	"github.com/fleetdm/fleet/v4/server/contexts/ctxerr"
@@ -15,15 +16,31 @@ import (
 const mfaTokenEntropyInBytes = 32
 
 func (ds *Datastore) SessionByMFAToken(ctx context.Context, token string, sessionKeySize int) (*fleet.Session, *fleet.User, error) {
+	if strings.HasPrefix(token, fleet.EmailPasswordlessTokenPrefix) {
+		return nil, nil, ctxerr.Wrap(ctx, notFound("Verification Token"))
+	}
+	return ds.sessionByVerificationToken(ctx, token, sessionKeySize, false)
+}
+
+func (ds *Datastore) SessionByEmailLoginToken(ctx context.Context, token string, sessionKeySize int) (*fleet.Session, *fleet.User, error) {
+	if !strings.HasPrefix(token, fleet.EmailPasswordlessTokenPrefix) {
+		return nil, nil, ctxerr.Wrap(ctx, notFound("Verification Token"))
+	}
+	return ds.sessionByVerificationToken(ctx, token, sessionKeySize, true)
+}
+
+func (ds *Datastore) sessionByVerificationToken(ctx context.Context, token string, sessionKeySize int, requireEmailLoginEligibility bool) (*fleet.Session, *fleet.User, error) {
+	eligibilityClause := ""
+	if requireEmailLoginEligibility {
+		eligibilityClause = " AND u.sso_enabled = 0 AND u.api_only = 0 AND u.admin_forced_password_reset = 0"
+	}
+	query := `SELECT vt.user_id
+		FROM verification_tokens vt
+		JOIN users u ON u.id = vt.user_id
+		WHERE vt.token = ? AND u.deleted = 0 AND vt.created_at >= NOW() - INTERVAL ? SECOND` + eligibilityClause
+
 	var userID uint
-	err := sqlx.GetContext(
-		ctx,
-		ds.reader(ctx),
-		&userID,
-		"SELECT user_id FROM verification_tokens WHERE token = ? AND created_at >= NOW() - INTERVAL ? SECOND",
-		token,
-		fleet.MFALinkTTL.Seconds(),
-	)
+	err := sqlx.GetContext(ctx, ds.reader(ctx), &userID, query, token, fleet.MFALinkTTL.Seconds())
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil, ctxerr.Wrap(ctx, notFound("Verification Token"))
@@ -33,7 +50,7 @@ func (ds *Datastore) SessionByMFAToken(ctx context.Context, token string, sessio
 
 	// Load the user before consuming the token: if this fails (e.g. the user was
 	// concurrently deleted or a transient read error occurs) the token is left
-	// intact so the login link can be retried, matching the pre-fix behavior.
+	// intact so the login link can be retried.
 	user, err := ds.UserByID(ctx, userID)
 	if err != nil {
 		return nil, nil, err
@@ -41,19 +58,10 @@ func (ds *Datastore) SessionByMFAToken(ctx context.Context, token string, sessio
 
 	var session *fleet.Session
 	err = ds.withTx(ctx, func(tx sqlx.ExtContext) error {
-		// Lock the token row and re-check its validity so that concurrent
-		// redemptions of the same one-time token are serialized. The loser of the
-		// race blocks here, re-reads after the winner commits its delete, finds no
-		// row, and aborts before creating a session.
+		// Lock the token and matching user row, then re-check expiry and eligibility.
+		// Concurrent redemptions serialize here, so only one session can be minted.
 		var lockedUserID uint
-		err := sqlx.GetContext(
-			ctx,
-			tx,
-			&lockedUserID,
-			"SELECT user_id FROM verification_tokens WHERE token = ? AND created_at >= NOW() - INTERVAL ? SECOND FOR UPDATE",
-			token,
-			fleet.MFALinkTTL.Seconds(),
-		)
+		err := sqlx.GetContext(ctx, tx, &lockedUserID, query+" FOR UPDATE", token, fleet.MFALinkTTL.Seconds())
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ctxerr.Wrap(ctx, notFound("Verification Token"))
@@ -72,7 +80,6 @@ func (ds *Datastore) SessionByMFAToken(ctx context.Context, token string, sessio
 		if session, err = ds.makeSessionInTransaction(ctx, tx, lockedUserID, sessionKeySize); err != nil {
 			return err
 		}
-
 		return nil
 	})
 	if err != nil {
@@ -83,22 +90,72 @@ func (ds *Datastore) SessionByMFAToken(ctx context.Context, token string, sessio
 }
 
 func (ds *Datastore) NewMFAToken(ctx context.Context, userID uint) (string, error) {
+	return ds.newVerificationToken(ctx, userID, "")
+}
+
+func (ds *Datastore) NewEmailLoginToken(ctx context.Context, userID uint) (string, error) {
+	randomToken, err := server.GenerateRandomURLSafeText(mfaTokenEntropyInBytes)
+	if err != nil {
+		return "", err
+	}
+	token := fleet.EmailPasswordlessTokenPrefix + randomToken
+
+	err = ds.withTx(ctx, func(tx sqlx.ExtContext) error {
+		// Serialize requests per user so distributed callers cannot race the
+		// per-account cooldown and send an email storm.
+		var lockedUserID uint
+		if err := sqlx.GetContext(ctx, tx, &lockedUserID, "SELECT id FROM users WHERE id = ? AND deleted = 0 FOR UPDATE", userID); err != nil {
+			return ctxerr.Wrap(ctx, err, "locking user for email login token")
+		}
+
+		var recentID uint
+		err := sqlx.GetContext(ctx, tx, &recentID, `SELECT id FROM verification_tokens
+			WHERE user_id = ? AND token LIKE CONCAT(?, '%')
+			AND created_at >= NOW() - INTERVAL ? SECOND
+			ORDER BY created_at DESC LIMIT 1`, userID, fleet.EmailPasswordlessTokenPrefix, fleet.EmailPasswordlessRequestCooldown.Seconds())
+		if err == nil {
+			token = ""
+			return nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return ctxerr.Wrap(ctx, err, "checking email login token cooldown")
+		}
+
+		if _, err := tx.ExecContext(ctx, `DELETE FROM verification_tokens
+			WHERE user_id = ? AND token LIKE CONCAT(?, '%')`, userID, fleet.EmailPasswordlessTokenPrefix); err != nil {
+			return ctxerr.Wrap(ctx, err, "deleting prior email login tokens")
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO verification_tokens (user_id, token) VALUES (?, ?)`, userID, token); err != nil {
+			return ctxerr.Wrap(ctx, err, "creating email login token")
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func (ds *Datastore) DeleteEmailLoginToken(ctx context.Context, token string) error {
+	if !strings.HasPrefix(token, fleet.EmailPasswordlessTokenPrefix) {
+		return nil
+	}
+	if _, err := ds.writer(ctx).ExecContext(ctx, "DELETE FROM verification_tokens WHERE token = ?", token); err != nil {
+		return ctxerr.Wrap(ctx, err, "deleting email login token")
+	}
+	return nil
+}
+
+func (ds *Datastore) newVerificationToken(ctx context.Context, userID uint, prefix string) (string, error) {
 	token, err := server.GenerateRandomURLSafeText(mfaTokenEntropyInBytes)
 	if err != nil {
 		return "", err
 	}
+	token = prefix + token
 
-	_, err = ds.writer(ctx).ExecContext(
-		ctx,
-		`INSERT INTO verification_tokens (user_id, token) VALUES (?, ?)`,
-		userID,
-		token,
-	)
-
-	if err != nil {
+	if _, err = ds.writer(ctx).ExecContext(ctx, `INSERT INTO verification_tokens (user_id, token) VALUES (?, ?)`, userID, token); err != nil {
 		return "", err
 	}
-
 	return token, nil
 }
 

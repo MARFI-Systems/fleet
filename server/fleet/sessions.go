@@ -54,9 +54,19 @@ type SessionSSOSettings struct {
 	IDPImageURL string `json:"idp_image_url"`
 	// SSOEnabled true if single sign on is enabled.
 	SSOEnabled bool `json:"sso_enabled"`
+	// EmailPasswordlessEnabled is the server-side feature policy.
+	EmailPasswordlessEnabled bool `json:"email_passwordless_enabled"`
+	// EmailPasswordlessAvailable is true when the enabled feature also has a
+	// configured mail backend and can issue new links.
+	EmailPasswordlessAvailable bool `json:"email_passwordless_available"`
 }
 
 // Session is the model object which represents what an active session is
+const (
+	EmailPasswordlessTokenPrefix     = "pl-"
+	EmailPasswordlessRequestCooldown = time.Minute
+)
+
 type Session struct {
 	CreateTimestamp
 	ID         uint

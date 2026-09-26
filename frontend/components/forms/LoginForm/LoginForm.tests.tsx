@@ -21,7 +21,7 @@ describe("LoginForm - component", () => {
         isSubmitting={false}
         pendingEmail={false}
         ssoSettings={settings}
-      />
+      />,
     );
 
     expect(screen.getByText(baseError)).toBeInTheDocument();
@@ -34,7 +34,7 @@ describe("LoginForm - component", () => {
         isSubmitting={false}
         pendingEmail={false}
         ssoSettings={settings}
-      />
+      />,
     );
 
     expect(screen.queryByText(baseError)).not.toBeInTheDocument();
@@ -47,7 +47,7 @@ describe("LoginForm - component", () => {
         isSubmitting={false}
         pendingEmail={false}
         ssoSettings={settings}
-      />
+      />,
     );
 
     expect(screen.getByPlaceholderText("Email")).toBeInTheDocument();
@@ -61,7 +61,7 @@ describe("LoginForm - component", () => {
         isSubmitting={false}
         pendingEmail={false}
         ssoSettings={settings}
-      />
+      />,
     );
 
     // enter a valid password
@@ -70,7 +70,7 @@ describe("LoginForm - component", () => {
     // try to log in
     await user.click(screen.getByRole("button", { name: "Log in" }));
     expect(
-      screen.getByText("Email field must be completed")
+      screen.getByText("Email field must be completed"),
     ).toBeInTheDocument();
     expect(submitSpy).not.toHaveBeenCalled();
 
@@ -80,7 +80,7 @@ describe("LoginForm - component", () => {
     // try to log in again
     await user.click(screen.getByRole("button", { name: "Log in" }));
     expect(
-      screen.getByText("Email must be a valid email address")
+      screen.getByText("Email must be a valid email address"),
     ).toBeInTheDocument();
     expect(submitSpy).not.toHaveBeenCalled();
   });
@@ -92,7 +92,7 @@ describe("LoginForm - component", () => {
         isSubmitting={false}
         pendingEmail={false}
         ssoSettings={settings}
-      />
+      />,
     );
 
     await user.type(screen.getByPlaceholderText("Email"), validEmail);
@@ -101,7 +101,7 @@ describe("LoginForm - component", () => {
     await user.click(screen.getByRole("button", { name: "Log in" }));
 
     expect(
-      screen.getByText("Password field must be completed")
+      screen.getByText("Password field must be completed"),
     ).toBeInTheDocument();
     expect(submitSpy).not.toHaveBeenCalled();
   });
@@ -113,7 +113,7 @@ describe("LoginForm - component", () => {
         isSubmitting={false}
         pendingEmail={false}
         ssoSettings={settings}
-      />
+      />,
     );
 
     await user.click(screen.getByRole("button", { name: "Log in" }));
@@ -128,7 +128,7 @@ describe("LoginForm - component", () => {
         isSubmitting={false}
         pendingEmail={false}
         ssoSettings={settings}
-      />
+      />,
     );
 
     await user.type(screen.getByPlaceholderText("Email"), validEmail);
@@ -150,7 +150,7 @@ describe("LoginForm - component", () => {
           sso_enabled: true,
           idp_name: "Test IdP",
         }}
-      />
+      />,
     );
 
     expect(screen.getByPlaceholderText("Email")).toHaveFocus();
@@ -160,9 +160,113 @@ describe("LoginForm - component", () => {
     expect(screen.getByText("Log in").parentElement).toHaveFocus();
     await user.tab();
     expect(
-      screen.getByRole("button", { name: /sign in with sso/i })
+      screen.getByRole("button", { name: /sign in with sso/i }),
     ).toHaveFocus();
     await user.tab();
     expect(screen.getByText("Forgot password?")).toHaveFocus();
+  });
+});
+
+describe("LoginForm - email-only sign-in", () => {
+  const settings = { sso_enabled: false, email_passwordless_enabled: true };
+
+  it("shows only email and removes password recovery", () => {
+    render(
+      <LoginForm
+        handleSubmit={jest.fn()}
+        isSubmitting={false}
+        pendingEmail={false}
+        ssoSettings={settings}
+      />,
+    );
+    expect(screen.getByPlaceholderText("Email")).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText("Password")).not.toBeInTheDocument();
+    expect(screen.queryByText("Forgot password?")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Send sign-in link" }),
+    ).toBeInTheDocument();
+  });
+
+  it("submits email without requiring a password", async () => {
+    const submit = jest.fn().mockResolvedValue(undefined);
+    const { user } = renderWithSetup(
+      <LoginForm
+        handleSubmit={submit}
+        isSubmitting={false}
+        pendingEmail={false}
+        ssoSettings={settings}
+      />,
+    );
+    await user.type(screen.getByPlaceholderText("Email"), validEmail);
+    await user.click(screen.getByRole("button", { name: "Send sign-in link" }));
+    expect(submit).toHaveBeenCalledWith({ email: validEmail, password: "" });
+  });
+
+  it("rejects invalid email before requesting a link", async () => {
+    const submit = jest.fn();
+    const { user } = renderWithSetup(
+      <LoginForm
+        handleSubmit={submit}
+        isSubmitting={false}
+        pendingEmail={false}
+        ssoSettings={settings}
+      />,
+    );
+    await user.type(screen.getByPlaceholderText("Email"), invalidEmail);
+    await user.click(screen.getByRole("button", { name: "Send sign-in link" }));
+    expect(
+      screen.getByText("Email must be a valid email address"),
+    ).toBeInTheDocument();
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("does not reveal whether an account exists", () => {
+    render(
+      <LoginForm
+        handleSubmit={jest.fn()}
+        isSubmitting={false}
+        pendingEmail
+        ssoSettings={settings}
+      />,
+    );
+    expect(
+      screen.getByText(/is eligible for email sign-in/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/We sent an email to you/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("retains the explicitly selected recovery form", () => {
+    render(
+      <LoginForm
+        handleSubmit={jest.fn()}
+        isSubmitting={false}
+        pendingEmail={false}
+        ssoSettings={settings}
+        recoveryLogin
+      />,
+    );
+    expect(screen.getByPlaceholderText("Password")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Log in" })).toBeInTheDocument();
+    expect(screen.getByText("Forgot password?")).toHaveAttribute(
+      "href",
+      expect.stringContaining("recovery=1"),
+    );
+  });
+
+  it("keeps SSO available alongside email sign-in", () => {
+    render(
+      <LoginForm
+        handleSubmit={jest.fn()}
+        isSubmitting={false}
+        pendingEmail={false}
+        ssoSettings={{ ...settings, sso_enabled: true }}
+      />,
+    );
+    expect(
+      screen.getByRole("button", { name: /sign in with sso/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText("Password")).not.toBeInTheDocument();
   });
 });

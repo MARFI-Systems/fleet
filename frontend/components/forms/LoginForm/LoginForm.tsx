@@ -22,6 +22,7 @@ interface ILoginFormProps {
   pendingEmail: boolean;
   ssoSettings?: ISSOSettings;
   handleSSOSignOn?: () => void;
+  recoveryLogin?: boolean;
 }
 
 const LoginForm = ({
@@ -31,12 +32,16 @@ const LoginForm = ({
   pendingEmail,
   ssoSettings,
   handleSSOSignOn,
+  recoveryLogin = false,
 }: ILoginFormProps): JSX.Element => {
   const {
     idp_name: idpName,
     idp_image_url: imageURL,
     sso_enabled: ssoEnabled,
   } = ssoSettings || {}; // TODO: Consider refactoring ssoSettings undefined
+
+  const magicLinkEnabled =
+    !!ssoSettings?.email_passwordless_enabled && !recoveryLogin;
 
   const loginFormClass = classnames(baseClass);
 
@@ -62,7 +67,7 @@ const LoginForm = ({
       validationErrors.email = "Email must be a valid email address";
     }
 
-    if (!validatePresence(password)) {
+    if (!magicLinkEnabled && !validatePresence(password)) {
       validationErrors.password = "Password field must be completed";
     }
 
@@ -77,7 +82,10 @@ const LoginForm = ({
     const valid = validate();
 
     if (valid) {
-      return handleSubmit(formData);
+      return handleSubmit({
+        email: formData.email.trim(),
+        password: magicLinkEnabled ? "" : formData.password,
+      });
     }
     return false;
   };
@@ -141,8 +149,17 @@ const LoginForm = ({
           </Button>
           <h1>Check your email</h1>
           <p className={`${baseClass}__text`}>
-            We sent an email to you at <b>{formData.email}</b>. <br />
-            Please click the magic link in the email to sign in.
+            {magicLinkEnabled ? (
+              <>
+                If <b>{formData.email.trim()}</b> is eligible for email sign-in,
+                you will receive a link. Open it to continue.
+              </>
+            ) : (
+              <>
+                We sent an email to you at <b>{formData.email}</b>. <br />
+                Please click the magic link in the email to sign in.
+              </>
+            )}
           </p>
         </>
       </div>
@@ -152,6 +169,13 @@ const LoginForm = ({
   return (
     <form onSubmit={onFormSubmit} className={loginFormClass} noValidate>
       {baseError && <div className="form__base-error">{baseError}</div>}
+      {magicLinkEnabled &&
+        ssoSettings?.email_passwordless_available === false && (
+          <p role="alert">
+            Email sign-in is temporarily unavailable. Contact your Fleet
+            administrator.
+          </p>
+        )}
       <div className={`${baseClass}__form`}>
         <InputFieldWithIcon
           error={errors.email}
@@ -163,15 +187,17 @@ const LoginForm = ({
           onChange={onInputChange("email")}
           ignore1Password={false}
         />
-        <InputFieldWithIcon
-          error={errors.password}
-          label="Password"
-          placeholder="Password"
-          type="password"
-          value={formData.password}
-          onChange={onInputChange("password")}
-          ignore1Password={false}
-        />
+        {!magicLinkEnabled && (
+          <InputFieldWithIcon
+            error={errors.password}
+            label="Password"
+            placeholder="Password"
+            type="password"
+            value={formData.password}
+            onChange={onInputChange("password")}
+            ignore1Password={false}
+          />
+        )}
       </div>
       {/* Actions displayed using CSS column-reverse to preserve tab order */}
       <div className={`${baseClass}__actions`}>
@@ -179,18 +205,29 @@ const LoginForm = ({
           <Button
             className={`${baseClass}__login-btn`}
             isLoading={isSubmitting}
+            disabled={
+              isSubmitting ||
+              (magicLinkEnabled &&
+                ssoSettings?.email_passwordless_available === false)
+            }
             type="submit"
             tabIndex={0}
           >
-            Log in
+            {magicLinkEnabled ? "Send sign-in link" : "Log in"}
           </Button>
           {ssoEnabled && renderSingleSignOnButton()}
         </div>
-        <CustomLink
-          className={`${baseClass}__forgot-link`}
-          url={paths.FORGOT_PASSWORD}
-          text="Forgot password?"
-        />
+        {!magicLinkEnabled && (
+          <CustomLink
+            className={`${baseClass}__forgot-link`}
+            url={
+              recoveryLogin
+                ? `${paths.FORGOT_PASSWORD}?recovery=1`
+                : paths.FORGOT_PASSWORD
+            }
+            text="Forgot password?"
+          />
+        )}
       </div>
     </form>
   );
