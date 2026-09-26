@@ -37,7 +37,7 @@ func (ds *Datastore) sessionByVerificationToken(ctx context.Context, token strin
 	query := `SELECT vt.user_id
 		FROM verification_tokens vt
 		JOIN users u ON u.id = vt.user_id
-		WHERE vt.token = ? AND u.deleted = 0 AND vt.created_at >= NOW() - INTERVAL ? SECOND` + eligibilityClause
+		WHERE vt.token = ? AND vt.created_at >= NOW() - INTERVAL ? SECOND` + eligibilityClause
 
 	var userID uint
 	err := sqlx.GetContext(ctx, ds.reader(ctx), &userID, query, token, fleet.MFALinkTTL.Seconds())
@@ -104,7 +104,7 @@ func (ds *Datastore) NewEmailLoginToken(ctx context.Context, userID uint) (strin
 		// Serialize requests per user so distributed callers cannot race the
 		// per-account cooldown and send an email storm.
 		var lockedUserID uint
-		if err := sqlx.GetContext(ctx, tx, &lockedUserID, "SELECT id FROM users WHERE id = ? AND deleted = 0 FOR UPDATE", userID); err != nil {
+		if err := sqlx.GetContext(ctx, tx, &lockedUserID, "SELECT id FROM users WHERE id = ? FOR UPDATE", userID); err != nil {
 			return ctxerr.Wrap(ctx, err, "locking user for email login token")
 		}
 

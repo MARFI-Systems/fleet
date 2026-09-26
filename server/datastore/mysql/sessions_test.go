@@ -234,6 +234,16 @@ func testEmailPasswordless(t *testing.T, ds *Datastore) {
 	})
 	_, _, err = ds.SessionByEmailLoginToken(ctx, expiredToken, 8)
 	require.Error(t, err)
+
+	// Fleet moves deleted users to users_deleted; there is no users.deleted column.
+	deletedToken, err := ds.NewEmailLoginToken(ctx, user.ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, deletedToken)
+	require.NoError(t, ds.DeleteUser(ctx, user.ID))
+	_, _, err = ds.SessionByEmailLoginToken(ctx, deletedToken, 8)
+	require.Error(t, err)
+	_, err = ds.NewEmailLoginToken(ctx, user.ID)
+	require.Error(t, err)
 }
 
 func sessionKeys(sessions []*fleet.Session) []string {
