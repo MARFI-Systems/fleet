@@ -115,6 +115,35 @@ func (svc *Service) DeleteSession(ctx context.Context, id uint) error {
 // Login
 ////////////////////////////////////////////////////////////////////////////////
 
+const emailLoginAcceptedMessage = "If an eligible account exists, a sign-in link will be sent."
+
+type emailLoginResponse struct {
+	Message string `json:"message"`
+	Err     error  `json:"error,omitempty"`
+}
+
+func (r emailLoginResponse) Status() int  { return http.StatusAccepted }
+func (r emailLoginResponse) Error() error { return r.Err }
+
+func emailLoginEndpoint(ctx context.Context, request interface{}, svc fleet.Service) (fleet.Errorer, error) {
+	start := time.Now()
+	defer func() { time.Sleep(time.Until(start.Add(time.Second))) }()
+
+	req := request.(*fleet.EmailLoginRequest)
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+	if fleet.IsLooseEmail(email) {
+		if err := svc.RequestEmailLogin(ctx, email); err != nil {
+			// The response intentionally stays identical for unknown, ineligible,
+			// throttled, misconfigured, and delivery-failed accounts.
+			logging.WithExtras(logging.WithNoUser(ctx),
+				"msg", "email login request was not delivered",
+				"public_ip", publicip.FromContext(ctx),
+			)
+		}
+	}
+	return emailLoginResponse{Message: emailLoginAcceptedMessage}, nil
+}
+
 type loginMfaResponse struct {
 	Message string `json:"message"`
 	Err     error  `json:"error,omitempty"`
@@ -168,6 +197,84 @@ func loginEndpoint(ctx context.Context, request interface{}, svc fleet.Service) 
 //goland:noinspection GoErrorStringFormat
 var sendingMFAEmail = errors.New("sending MFA email")
 
+func emailPasswordlessUserEligible(user *fleet.User) bool {
+	return user != nil && !user.Deleted && !user.SSOEnabled && !user.APIOnly && !user.AdminForcedPasswordReset
+}
+
+// emailPasswordlessRecoveryUser only allows explicitly configured local global
+// admins to retain password access. A frontend recovery query cannot grant it.
+func (svc *Service) emailPasswordlessRecoveryUser(user *fleet.User) bool {
+	if user == nil || user.Deleted || user.SSOEnabled || user.APIOnly || user.GlobalRole == nil || *user.GlobalRole != "admin" {
+		return false
+	}
+	for _, email := range strings.Split(svc.config.Auth.EmailPasswordlessRecoveryEmails, ",") {
+		if strings.TrimSpace(email) != "" && strings.EqualFold(strings.TrimSpace(email), user.Email) {
+			return true
+		}
+	}
+	return false
+}
+
+func (svc *Service) emailPasswordlessReady(appConfig *fleet.AppConfig) bool {
+	if !svc.config.Auth.EmailPasswordlessEnabled || appConfig == nil {
+		return false
+	}
+	var smtpSettings fleet.SMTPSettings
+	if appConfig.SMTPSettings != nil {
+		smtpSettings = *appConfig.SMTPSettings
+	}
+	return svc.mailService.CanSendEmail(smtpSettings)
+}
+
+func (svc *Service) RequestEmailLogin(ctx context.Context, email string) error {
+	// skipauth: This endpoint intentionally does not reveal whether a user exists.
+	svc.authz.SkipAuthorization(ctx)
+	logging.WithLevel(logging.WithExtras(logging.WithNoUser(ctx),
+		"op", "request_email_login",
+		"public_ip", publicip.FromContext(ctx),
+	), slog.LevelInfo)
+
+	appConfig, err := svc.ds.AppConfig(ctx)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "checking email login configuration")
+	}
+	if !svc.emailPasswordlessReady(appConfig) {
+		return nil
+	}
+
+	user, err := svc.ds.UserByEmail(ctx, email)
+	var nfe fleet.NotFoundError
+	if errors.As(err, &nfe) {
+		return nil
+	}
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "finding email login user")
+	}
+	if !emailPasswordlessUserEligible(user) {
+		return nil
+	}
+
+	token, err := svc.ds.NewEmailLoginToken(ctx, user.ID)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "creating email login token")
+	}
+	if token == "" {
+		return nil // per-account cooldown; keep the public response indistinguishable
+	}
+
+	if err := svc.sendPasswordlessLoginEmail(ctx, *user, *appConfig, token); err != nil {
+		// A failed delivery must not leave a live token that also suppresses the
+		// user's next request during the per-account cooldown.
+		if cleanupErr := svc.ds.DeleteEmailLoginToken(ctx, token); cleanupErr != nil {
+			logging.WithExtras(logging.WithNoUser(ctx),
+				"msg", "failed to remove undelivered email login token",
+			)
+		}
+		return ctxerr.Wrap(ctx, err, "sending email login")
+	}
+	return nil
+}
+
 func (svc *Service) Login(ctx context.Context, email, password string, supportsEmailVerification bool) (*fleet.User, *fleet.Session, error) {
 	// skipauth: No user context available yet to authorize against.
 	svc.authz.SkipAuthorization(ctx)
@@ -213,7 +320,18 @@ func (svc *Service) Login(ctx context.Context, email, password string, supportsE
 	if user.SSOEnabled {
 		err = fleet.NewAuthFailedError("password login disabled for sso users")
 		return nil, nil, err
-	} else if user.MFAEnabled {
+	}
+
+	// Passwordless mode replaces normal interactive password login. API-only
+	// users, explicitly allowlisted local recovery admins, and users forced through password reset retain
+	// the existing password path. Mail misconfiguration does not silently reopen
+	// password login; discovery reports that outage separately.
+	if emailPasswordlessUserEligible(user) && svc.config.Auth.EmailPasswordlessEnabled && !svc.emailPasswordlessRecoveryUser(user) {
+		err = fleet.NewAuthFailedError("password login disabled for passwordless users")
+		return nil, nil, err
+	}
+
+	if user.MFAEnabled {
 		if !supportsEmailVerification {
 			err = fleet.NewAuthFailedError("client with no MFA email support")
 			return nil, nil, err
@@ -325,9 +443,27 @@ func (svc *Service) CompleteMFA(ctx context.Context, token string) (*fleet.Sessi
 		}
 	}(time.Now())
 
-	session, user, err := svc.ds.SessionByMFAToken(ctx, token, svc.config.Session.KeySize)
+	var session *fleet.Session
+	var user *fleet.User
+	if strings.HasPrefix(token, fleet.EmailPasswordlessTokenPrefix) {
+		if !svc.config.Auth.EmailPasswordlessEnabled {
+			err = fleet.NewAuthFailedError("email passwordless login is disabled")
+			return nil, nil, err
+		}
+		session, user, err = svc.ds.SessionByEmailLoginToken(ctx, token, svc.config.Session.KeySize)
+	} else {
+		session, user, err = svc.ds.SessionByMFAToken(ctx, token, svc.config.Session.KeySize)
+	}
 	if err != nil {
 		return nil, nil, fleet.NewAuthFailedError(err.Error())
+	}
+
+	// Match password login eligibility. If the license no longer permits the
+	// user's role, destroy the newly minted session before returning.
+	if !license.IsPremium(ctx) && fleet.PremiumRolesPresent(user.GlobalRole, user.Teams) {
+		_ = svc.ds.DestroySession(ctx, session)
+		err = fleet.ErrMissingLicense
+		return nil, nil, err
 	}
 
 	if err := svc.NewActivity(
@@ -880,41 +1016,62 @@ func (svc *Service) SSOSettings(ctx context.Context) (*fleet.SessionSSOSettings,
 	}
 
 	settings := &fleet.SessionSSOSettings{
-		IDPName:     ssoSettings.IDPName,
-		IDPImageURL: ssoSettings.IDPImageURL,
-		SSOEnabled:  ssoSettings.EnableSSO,
+		IDPName:                    ssoSettings.IDPName,
+		IDPImageURL:                ssoSettings.IDPImageURL,
+		SSOEnabled:                 ssoSettings.EnableSSO,
+		EmailPasswordlessEnabled:   svc.config.Auth.EmailPasswordlessEnabled,
+		EmailPasswordlessAvailable: svc.emailPasswordlessReady(appConfig),
 	}
 	return settings, nil
 }
 
-// makeMFAEmail sends an MFA email to the given user
+// makeMFAEmail sends an MFA email to the given user.
 func (svc *Service) makeMFAEmail(ctx context.Context, user fleet.User) error {
-	token, err := svc.ds.NewMFAToken(ctx, user.ID)
-	if err != nil {
-		return ctxerr.Wrap(ctx, err, "creating MFA token")
-	}
-
-	config, err := svc.ds.AppConfig(ctx)
+	appConfig, err := svc.ds.AppConfig(ctx)
 	if err != nil {
 		return err
 	}
 	var smtpSettings fleet.SMTPSettings
-	if config.SMTPSettings != nil {
-		smtpSettings = *config.SMTPSettings
+	if appConfig.SMTPSettings != nil {
+		smtpSettings = *appConfig.SMTPSettings
+	}
+	if !svc.mailService.CanSendEmail(smtpSettings) {
+		return fleet.ErrPasswordResetNotConfigured
+	}
+
+	token, err := svc.ds.NewMFAToken(ctx, user.ID)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "creating MFA token")
+	}
+	return svc.sendLoginEmail(ctx, user, *appConfig, &mail.MFAMailer{
+		FullName: user.Name,
+		Token:    token,
+		BaseURL:  emailLinkBaseURL(appConfig.ServerSettings.ServerURL, svc.config.Server.URLPrefix),
+		AssetURL: getAssetURL(),
+	})
+}
+
+func (svc *Service) sendPasswordlessLoginEmail(ctx context.Context, user fleet.User, appConfig fleet.AppConfig, token string) error {
+	return svc.sendLoginEmail(ctx, user, appConfig, &mail.PasswordlessMailer{
+		FullName: user.Name,
+		Token:    token,
+		BaseURL:  emailLinkBaseURL(appConfig.ServerSettings.ServerURL, svc.config.Server.URLPrefix),
+		AssetURL: getAssetURL(),
+	})
+}
+
+func (svc *Service) sendLoginEmail(ctx context.Context, user fleet.User, appConfig fleet.AppConfig, loginMailer fleet.Mailer) error {
+	var smtpSettings fleet.SMTPSettings
+	if appConfig.SMTPSettings != nil {
+		smtpSettings = *appConfig.SMTPSettings
 	}
 	email := fleet.Email{
 		Subject:      "Log in to Fleet",
 		To:           []string{user.Email},
-		ServerURL:    config.ServerSettings.ServerURL,
+		ServerURL:    appConfig.ServerSettings.ServerURL,
 		SMTPSettings: smtpSettings,
-		Mailer: &mail.MFAMailer{
-			FullName: user.Name,
-			Token:    token,
-			BaseURL:  emailLinkBaseURL(config.ServerSettings.ServerURL, svc.config.Server.URLPrefix),
-			AssetURL: getAssetURL(),
-		},
+		Mailer:       loginMailer,
 	}
-
 	return svc.mailService.SendEmail(ctx, email)
 }
 

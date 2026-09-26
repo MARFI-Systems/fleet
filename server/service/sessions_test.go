@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"encoding/base64"
+	"errors"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
@@ -15,6 +17,7 @@ import (
 	"github.com/fleetdm/fleet/v4/server/datastore/mysql/mysqltest"
 	"github.com/fleetdm/fleet/v4/server/datastore/redis/redistest"
 	"github.com/fleetdm/fleet/v4/server/fleet"
+	fleetmail "github.com/fleetdm/fleet/v4/server/mail"
 	"github.com/fleetdm/fleet/v4/server/mock"
 	"github.com/fleetdm/fleet/v4/server/ptr"
 	"github.com/fleetdm/fleet/v4/server/test"
@@ -190,7 +193,7 @@ func TestMFA(t *testing.T) {
 		return mfaToken, nil
 	}
 	ds.AppConfigFunc = func(ctx context.Context) (*fleet.AppConfig, error) {
-		return &fleet.AppConfig{}, nil
+		return &fleet.AppConfig{SMTPSettings: &fleet.SMTPSettings{SMTPConfigured: true}}, nil
 	}
 	innerSvc := &Service{
 		ds:          ds,
@@ -236,6 +239,163 @@ func TestMFA(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, resp.Error())
 	require.True(t, opts.ActivityMock.NewActivityFuncInvoked)
+}
+
+func TestEmailPasswordless(t *testing.T) {
+	configuredApp := &fleet.AppConfig{
+		SMTPSettings:   &fleet.SMTPSettings{SMTPConfigured: true},
+		ServerSettings: fleet.ServerSettings{ServerURL: "https://fleet.example.com"},
+	}
+	eligibleUser := &fleet.User{ID: 42, Name: "Ada", Email: "ada@example.com", GlobalRole: ptr.String(fleet.RoleObserver)}
+	require.NoError(t, eligibleUser.SetPassword(test.GoodPassword, 10, 10))
+
+	t.Run("default off and email misconfiguration fail closed", func(t *testing.T) {
+		ds := new(mock.Store)
+		ds.AppConfigFunc = func(context.Context) (*fleet.AppConfig, error) {
+			return &fleet.AppConfig{SMTPSettings: &fleet.SMTPSettings{}}, nil
+		}
+		cfg := config.TestConfig()
+		svc, ctx := newTestServiceWithConfig(t, ds, cfg, nil, nil)
+		require.NoError(t, svc.RequestEmailLogin(ctx, eligibleUser.Email))
+		require.False(t, ds.UserByEmailFuncInvoked)
+
+		cfg.Auth.EmailPasswordlessEnabled = true
+		svc, ctx = newTestServiceWithConfig(t, ds, cfg, nil, nil)
+		require.NoError(t, svc.RequestEmailLogin(ctx, eligibleUser.Email))
+		require.False(t, ds.UserByEmailFuncInvoked)
+		settings, err := svc.SSOSettings(ctx)
+		require.NoError(t, err)
+		require.True(t, settings.EmailPasswordlessEnabled)
+		require.False(t, settings.EmailPasswordlessAvailable)
+	})
+
+	t.Run("eligible request creates a prefixed token and advertises discovery", func(t *testing.T) {
+		ds := new(mock.Store)
+		ds.AppConfigFunc = func(context.Context) (*fleet.AppConfig, error) { return configuredApp, nil }
+		ds.UserByEmailFunc = func(context.Context, string) (*fleet.User, error) { return eligibleUser, nil }
+		ds.NewEmailLoginTokenFunc = func(context.Context, uint) (string, error) {
+			return fleet.EmailPasswordlessTokenPrefix + "token", nil
+		}
+		ds.DeleteEmailLoginTokenFunc = func(context.Context, string) error { return nil }
+		cfg := config.TestConfig()
+		cfg.Auth.EmailPasswordlessEnabled = true
+		svc, ctx := newTestServiceWithConfig(t, ds, cfg, nil, nil)
+		var sentEmail fleet.Email
+		coreSvc := svc.(validationMiddleware).Service.(*Service)
+		coreSvc.mailService = &mockMailService{SendEmailFn: func(email fleet.Email) error {
+			sentEmail = email
+			return nil
+		}}
+
+		require.NoError(t, svc.RequestEmailLogin(ctx, eligibleUser.Email))
+		require.True(t, ds.NewEmailLoginTokenFuncInvoked)
+		passwordlessMailer, ok := sentEmail.Mailer.(*fleetmail.PasswordlessMailer)
+		require.True(t, ok)
+		require.Equal(t, fleet.EmailPasswordlessTokenPrefix+"token", passwordlessMailer.Token)
+		settings, err := svc.SSOSettings(ctx)
+		require.NoError(t, err)
+		require.True(t, settings.EmailPasswordlessEnabled)
+		require.True(t, settings.EmailPasswordlessAvailable)
+	})
+
+	t.Run("delivery failure deletes the live token", func(t *testing.T) {
+		ds := new(mock.Store)
+		ds.AppConfigFunc = func(context.Context) (*fleet.AppConfig, error) { return configuredApp, nil }
+		ds.UserByEmailFunc = func(context.Context, string) (*fleet.User, error) { return eligibleUser, nil }
+		ds.NewEmailLoginTokenFunc = func(context.Context, uint) (string, error) {
+			return fleet.EmailPasswordlessTokenPrefix + "token", nil
+		}
+		var deletedToken string
+		ds.DeleteEmailLoginTokenFunc = func(_ context.Context, token string) error {
+			deletedToken = token
+			return nil
+		}
+		cfg := config.TestConfig()
+		cfg.Auth.EmailPasswordlessEnabled = true
+		svc, ctx := newTestServiceWithConfig(t, ds, cfg, nil, nil)
+		coreSvc := svc.(validationMiddleware).Service.(*Service)
+		coreSvc.mailService = &mockMailService{SendEmailFn: func(fleet.Email) error { return errors.New("delivery failed") }}
+
+		resp, err := emailLoginEndpoint(ctx, &fleet.EmailLoginRequest{Email: eligibleUser.Email}, svc)
+		require.NoError(t, err)
+		require.Nil(t, resp.Error())
+		require.Equal(t, http.StatusAccepted, resp.(interface{ Status() int }).Status())
+		require.Equal(t, emailLoginAcceptedMessage, resp.(emailLoginResponse).Message)
+		require.Equal(t, fleet.EmailPasswordlessTokenPrefix+"token", deletedToken)
+	})
+
+	t.Run("ineligible users do not receive tokens", func(t *testing.T) {
+		for _, user := range []*fleet.User{
+			{ID: 1, Email: "sso@example.com", SSOEnabled: true},
+			{ID: 2, Email: "api@example.com", APIOnly: true},
+			{ID: 3, Email: "recovery@example.com", AdminForcedPasswordReset: true},
+			{ID: 4, Email: "deleted@example.com", Deleted: true},
+		} {
+			ds := new(mock.Store)
+			ds.AppConfigFunc = func(context.Context) (*fleet.AppConfig, error) { return configuredApp, nil }
+			ds.UserByEmailFunc = func(context.Context, string) (*fleet.User, error) { return user, nil }
+			cfg := config.TestConfig()
+			cfg.Auth.EmailPasswordlessEnabled = true
+			svc, ctx := newTestServiceWithConfig(t, ds, cfg, nil, nil)
+			require.NoError(t, svc.RequestEmailLogin(ctx, user.Email))
+			require.False(t, ds.NewEmailLoginTokenFuncInvoked)
+		}
+	})
+
+	t.Run("mail misconfiguration does not silently reopen password login", func(t *testing.T) {
+		ds := new(mock.Store)
+		ds.AppConfigFunc = func(context.Context) (*fleet.AppConfig, error) {
+			return &fleet.AppConfig{SMTPSettings: &fleet.SMTPSettings{}}, nil
+		}
+		ds.UserByEmailFunc = func(context.Context, string) (*fleet.User, error) { return eligibleUser, nil }
+		cfg := config.TestConfig()
+		cfg.Auth.EmailPasswordlessEnabled = true
+		svc, ctx := newTestServiceWithConfig(t, ds, cfg, nil, nil)
+		_, _, err := svc.Login(ctx, eligibleUser.Email, test.GoodPassword, true)
+		var authErr *fleet.AuthFailedError
+		require.ErrorAs(t, err, &authErr)
+		require.False(t, ds.NewSessionFuncInvoked)
+	})
+
+	t.Run("normal password login is replaced but recovery remains", func(t *testing.T) {
+		ds := new(mock.Store)
+		ds.AppConfigFunc = func(context.Context) (*fleet.AppConfig, error) { return configuredApp, nil }
+		ds.UserByEmailFunc = func(context.Context, string) (*fleet.User, error) { return eligibleUser, nil }
+		cfg := config.TestConfig()
+		cfg.Auth.EmailPasswordlessEnabled = true
+		svc, ctx := newTestServiceWithConfig(t, ds, cfg, nil, nil)
+		_, _, err := svc.Login(ctx, eligibleUser.Email, test.GoodPassword, true)
+		var authErr *fleet.AuthFailedError
+		require.ErrorAs(t, err, &authErr)
+		require.False(t, ds.NewSessionFuncInvoked)
+
+		recoveryUser := *eligibleUser
+		recoveryUser.AdminForcedPasswordReset = true
+		ds.UserByEmailFunc = func(context.Context, string) (*fleet.User, error) { return &recoveryUser, nil }
+		ds.NewSessionFunc = func(context.Context, uint, int) (*fleet.Session, error) {
+			return &fleet.Session{UserID: recoveryUser.ID, Key: "session"}, nil
+		}
+		_, session, err := svc.Login(ctx, recoveryUser.Email, test.GoodPassword, true)
+		require.NoError(t, err)
+		require.Equal(t, "session", session.Key)
+	})
+
+	t.Run("passwordless redemption uses the typed atomic consume path", func(t *testing.T) {
+		ds := new(mock.Store)
+		ds.AppConfigFunc = func(context.Context) (*fleet.AppConfig, error) { return configuredApp, nil }
+		ds.SessionByEmailLoginTokenFunc = func(context.Context, string, int) (*fleet.Session, *fleet.User, error) {
+			return &fleet.Session{UserID: eligibleUser.ID, Key: "session"}, eligibleUser, nil
+		}
+		cfg := config.TestConfig()
+		cfg.Auth.EmailPasswordlessEnabled = true
+		svc, ctx := newTestServiceWithConfig(t, ds, cfg, nil, nil)
+		session, user, err := svc.CompleteMFA(ctx, fleet.EmailPasswordlessTokenPrefix+"token")
+		require.NoError(t, err)
+		require.Equal(t, eligibleUser.ID, user.ID)
+		require.Equal(t, "session", session.Key)
+		require.True(t, ds.SessionByEmailLoginTokenFuncInvoked)
+		require.False(t, ds.SessionByMFATokenFuncInvoked)
+	})
 }
 
 func TestGetSessionByKey(t *testing.T) {
@@ -792,4 +952,25 @@ func TestDecodeCallbackRequestRelayState(t *testing.T) {
 	t.Run("an absent RelayState decodes to empty", func(t *testing.T) {
 		require.Empty(t, postWith(t, url.Values{}))
 	})
+}
+
+func TestEmailPasswordlessRecoveryAllowlist(t *testing.T) {
+	cfg := config.TestConfig()
+	cfg.Auth.EmailPasswordlessEnabled = true
+	cfg.Auth.EmailPasswordlessRecoveryEmails = "  recovery@example.com "
+	svc := &Service{config: cfg}
+	admin := &fleet.User{Email: "RECOVERY@example.com", GlobalRole: ptr.String("admin")}
+	require.True(t, svc.emailPasswordlessRecoveryUser(admin))
+	admin.GlobalRole = ptr.String("maintainer")
+	require.False(t, svc.emailPasswordlessRecoveryUser(admin))
+	admin.GlobalRole = ptr.String("admin")
+	admin.Email = "other@example.com"
+	require.False(t, svc.emailPasswordlessRecoveryUser(admin))
+	admin.Email = "recovery@example.com"
+	admin.SSOEnabled = true
+	require.False(t, svc.emailPasswordlessRecoveryUser(admin))
+	admin.SSOEnabled = false
+	admin.APIOnly = true
+	require.False(t, svc.emailPasswordlessRecoveryUser(admin))
+	require.False(t, svc.emailPasswordlessRecoveryUser(nil))
 }

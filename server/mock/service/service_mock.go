@@ -123,6 +123,8 @@ type LoginSSOUserFunc func(ctx context.Context, user *fleet.User, redirectURL st
 
 type SSOSettingsFunc func(ctx context.Context) (*fleet.SessionSSOSettings, error)
 
+type RequestEmailLoginFunc func(ctx context.Context, email string) error
+
 type LoginFunc func(ctx context.Context, email string, password string, supportsEmailVerification bool) (user *fleet.User, session *fleet.Session, err error)
 
 type GetSessionDurationFunc func(ctx context.Context) time.Duration
@@ -1170,6 +1172,9 @@ type Service struct {
 
 	SSOSettingsFunc        SSOSettingsFunc
 	SSOSettingsFuncInvoked bool
+
+	RequestEmailLoginFunc        RequestEmailLoginFunc
+	RequestEmailLoginFuncInvoked bool
 
 	LoginFunc        LoginFunc
 	LoginFuncInvoked bool
@@ -2870,6 +2875,13 @@ func (s *Service) SSOSettings(ctx context.Context) (*fleet.SessionSSOSettings, e
 	s.SSOSettingsFuncInvoked = true
 	s.mu.Unlock()
 	return s.SSOSettingsFunc(ctx)
+}
+
+func (s *Service) RequestEmailLogin(ctx context.Context, email string) error {
+	s.mu.Lock()
+	s.RequestEmailLoginFuncInvoked = true
+	s.mu.Unlock()
+	return s.RequestEmailLoginFunc(ctx, email)
 }
 
 func (s *Service) Login(ctx context.Context, email string, password string, supportsEmailVerification bool) (user *fleet.User, session *fleet.Session, err error) {

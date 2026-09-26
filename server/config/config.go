@@ -244,11 +244,13 @@ func (s ServerConfig) ValidateURLPrefix(initFatal func(err error, msg string)) {
 
 // AuthConfig defines configs related to user or host authorization
 type AuthConfig struct {
-	BcryptCost                  int           `yaml:"bcrypt_cost"`
-	SaltKeySize                 int           `yaml:"salt_key_size"`
-	SsoSessionValidityPeriod    time.Duration `yaml:"sso_session_validity_period"`
-	RequireHTTPMessageSignature bool          `yaml:"require_http_message_signature"`
-	SSORateLimitPerMinute       int           `yaml:"sso_rate_limit_per_minute"`
+	BcryptCost                      int           `yaml:"bcrypt_cost"`
+	SaltKeySize                     int           `yaml:"salt_key_size"`
+	SsoSessionValidityPeriod        time.Duration `yaml:"sso_session_validity_period"`
+	RequireHTTPMessageSignature     bool          `yaml:"require_http_message_signature"`
+	SSORateLimitPerMinute           int           `yaml:"sso_rate_limit_per_minute"`
+	EmailPasswordlessEnabled        bool          `yaml:"email_passwordless_enabled"`
+	EmailPasswordlessRecoveryEmails string        `yaml:"email_passwordless_recovery_emails"`
 }
 
 // AppConfig defines configs related to HTTP
@@ -1632,6 +1634,10 @@ func (man Manager) addConfigs() {
 		"Require HTTP message signatures for fleetd requests (Premium feature)")
 	man.addConfigInt("auth.sso_rate_limit_per_minute", 0,
 		"Number of allowed requests per minute to the SSO callback and Fleet Desktop device SSO endpoints (each in its own bucket; defaults to the login rate limit value)")
+	man.addConfigBool("auth.email_passwordless_enabled", false,
+		"Replace interactive password login with email magic links for eligible users; requires configured email delivery")
+	man.addConfigString("auth.email_passwordless_recovery_emails", "",
+		"Comma-separated global-admin emails permitted to use emergency password login when email passwordless is enabled")
 
 	// App
 	man.addConfigString("app.token_key", "CHANGEME",
@@ -2173,11 +2179,13 @@ func (man Manager) LoadConfig() FleetConfig {
 			EndpointRequestSizeOverrides:     man.getConfigEndpointRequestSizeOverrides(),
 		},
 		Auth: AuthConfig{
-			BcryptCost:                  man.getConfigInt("auth.bcrypt_cost"),
-			SaltKeySize:                 man.getConfigInt("auth.salt_key_size"),
-			SsoSessionValidityPeriod:    man.getConfigDuration("auth.sso_session_validity_period"),
-			RequireHTTPMessageSignature: man.getConfigBool("auth.require_http_message_signature"),
-			SSORateLimitPerMinute:       man.getConfigInt("auth.sso_rate_limit_per_minute"),
+			BcryptCost:                      man.getConfigInt("auth.bcrypt_cost"),
+			SaltKeySize:                     man.getConfigInt("auth.salt_key_size"),
+			SsoSessionValidityPeriod:        man.getConfigDuration("auth.sso_session_validity_period"),
+			RequireHTTPMessageSignature:     man.getConfigBool("auth.require_http_message_signature"),
+			SSORateLimitPerMinute:           man.getConfigInt("auth.sso_rate_limit_per_minute"),
+			EmailPasswordlessEnabled:        man.getConfigBool("auth.email_passwordless_enabled"),
+			EmailPasswordlessRecoveryEmails: man.getConfigString("auth.email_passwordless_recovery_emails"),
 		},
 		App: AppConfig{
 			TokenKeySize:              man.getConfigInt("app.token_key_size"),
@@ -2862,6 +2870,7 @@ func TestConfig() FleetConfig {
 			SaltKeySize:                 24,
 			SsoSessionValidityPeriod:    5 * time.Minute,
 			RequireHTTPMessageSignature: false,
+			EmailPasswordlessEnabled:    false,
 		},
 		Session: SessionConfig{
 			KeySize:  64,

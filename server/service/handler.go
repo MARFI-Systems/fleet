@@ -1290,6 +1290,9 @@ func attachFleetAPIRoutes(r *mux.Router, svc fleet.Service, config config.FleetC
 
 	ne.WithCustomMiddleware(loginLimiter).
 		POST("/api/_version_/fleet/login", loginEndpoint, fleet.LoginRequest{})
+	ne.WithCustomMiddleware(limiter.Limit("email_login", throttled.RateQuota{MaxRate: loginRateLimit, MaxBurst: 9})).
+		WithRequestBodySizeLimit(1024).
+		POST("/api/_version_/fleet/login/email", emailLoginEndpoint, fleet.EmailLoginRequest{})
 	ne.WithCustomMiddleware(limiter.Limit("mfa", throttled.RateQuota{MaxRate: loginRateLimit, MaxBurst: 9})).
 		POST("/api/_version_/fleet/sessions", sessionCreateEndpoint, sessionCreateRequest{})
 

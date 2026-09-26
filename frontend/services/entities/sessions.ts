@@ -27,6 +27,20 @@ export interface ILoginResponse {
 }
 
 export default {
+  requestEmailLink: (email: string): Promise<void> =>
+    sendRequest(
+      "POST",
+      `${endpoints.LOGIN}/email`,
+      { email },
+      "json",
+      undefined,
+      undefined,
+      true,
+    ).then((response) => {
+      if (response.status !== 202) {
+        throw response;
+      }
+    }),
   login: ({ email, password }: ILoginProps): Promise<ILoginResponse> => {
     const { LOGIN } = endpoints;
 
@@ -41,7 +55,7 @@ export default {
       "json",
       undefined,
       undefined,
-      true // returns raw data which includes the status code alongside data
+      true, // returns raw data which includes the status code alongside data
     ).then((rawResponse) => {
       if (rawResponse.status === 202) {
         // MFA; treat as an error and let the caller handle it

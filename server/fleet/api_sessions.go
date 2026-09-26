@@ -18,6 +18,10 @@ type LoginRequest struct {
 	SupportsEmailVerification bool `json:"supports_email_verification"`
 }
 
+type EmailLoginRequest struct {
+	Email string `json:"email"`
+}
+
 type LoginResponse struct {
 	User           *User          `json:"user,omitempty"`
 	AvailableTeams []*TeamSummary `json:"available_teams" renameto:"available_fleets"`

@@ -63,17 +63,21 @@ const LoginPage = ({ router, location }: ILoginPageProps) => {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [pendingEmail, setPendingEmail] = useState(false);
 
-  const { data: ssoSettings, isLoading: isLoadingSSOSettings } = useQuery<
-    ISSOSettingsResponse,
-    Error,
-    ISSOSettings
-  >(["ssoSettings"], () => sessionsAPI.ssoSettings(), {
-    enabled: !currentUser,
-    onError: (err) => {
-      console.error(err);
+  const {
+    data: ssoSettings,
+    isLoading: isLoadingSSOSettings,
+    isError: authSettingsError,
+  } = useQuery<ISSOSettingsResponse, Error, ISSOSettings>(
+    ["ssoSettings"],
+    () => sessionsAPI.ssoSettings(),
+    {
+      enabled: !currentUser,
+      onError: (err) => {
+        console.error(err);
+      },
+      select: (data) => data.settings,
     },
-    select: (data) => data.settings,
-  });
+  );
 
   useEffect(() => {
     // this only needs to run once so we can wrap it in useEffect to avoid unneccesary third-party
@@ -122,6 +126,15 @@ const LoginPage = ({ router, location }: ILoginPageProps) => {
       const { DASHBOARD, RESET_PASSWORD, NO_ACCESS } = paths;
 
       try {
+        const recoveryLogin =
+          new URLSearchParams(location.search).get("recovery") === "1";
+        if (ssoSettings?.email_passwordless_enabled && !recoveryLogin) {
+          await sessionsAPI.requestEmailLink(formData.email);
+          local.removeItem("auth_pending_mfa");
+          setErrors({});
+          setPendingEmail(true);
+          return;
+        }
         const response = await sessionsAPI.login(formData);
         const { user, available_teams, token, token_expires_at } = response;
 
@@ -151,8 +164,15 @@ const LoginPage = ({ router, location }: ILoginPageProps) => {
           // This (plus associated code in MfaPage) adds an extra click for browsers hitting the MFA landing page without
           // logging in first, ensuring MFA tokens don't get auto-redeemed in those cases. An example of such a browser
           // is an email link scanner (e.g. Microsoft's); see #26976.
-          local.setItem("auth_pending_mfa", "true");
+          if (ssoSettings?.email_passwordless_enabled) {
+            // Email-only links must not be consumed by a page load or mail scanner.
+            local.removeItem("auth_pending_mfa");
+          } else {
+            local.setItem("auth_pending_mfa", "true");
+          }
+          setErrors({});
           setPendingEmail(true);
+          return false;
         }
 
         const errorObject = formatErrorResponse(response);
@@ -170,7 +190,9 @@ const LoginPage = ({ router, location }: ILoginPageProps) => {
       setConfig,
       setCurrentTeam,
       setCurrentUser,
-    ]
+      ssoSettings?.email_passwordless_enabled,
+      location.search,
+    ],
   );
 
   const ssoSignOn = useCallback(async () => {
@@ -199,12 +221,23 @@ const LoginPage = ({ router, location }: ILoginPageProps) => {
     return <Spinner className={`${baseClass}__loading-spinner`} />;
   }
 
+  if (authSettingsError) {
+    return (
+      <AuthenticationFormWrapper header="Sign-in unavailable">
+        <p>Unable to load sign-in settings. Reload the page to try again.</p>
+      </AuthenticationFormWrapper>
+    );
+  }
+
   return (
     <AuthenticationFormWrapper header="Welcome to Fleet">
       <LoginForm
         handleSubmit={onSubmit}
         baseError={errors.base}
         ssoSettings={ssoSettings}
+        recoveryLogin={
+          new URLSearchParams(location.search).get("recovery") === "1"
+        }
         handleSSOSignOn={ssoSignOn}
         isSubmitting={isSubmitting}
         pendingEmail={pendingEmail}

@@ -436,6 +436,12 @@ type SessionByMFATokenFunc func(ctx context.Context, token string, sessionKeySiz
 
 type NewMFATokenFunc func(ctx context.Context, userID uint) (string, error)
 
+type NewEmailLoginTokenFunc func(ctx context.Context, userID uint) (string, error)
+
+type SessionByEmailLoginTokenFunc func(ctx context.Context, token string, sessionKeySize int) (*fleet.Session, *fleet.User, error)
+
+type DeleteEmailLoginTokenFunc func(ctx context.Context, token string) error
+
 type NewAppConfigFunc func(ctx context.Context, info *fleet.AppConfig) (*fleet.AppConfig, error)
 
 type SaveAppConfigFunc func(ctx context.Context, info *fleet.AppConfig) error
@@ -3002,6 +3008,15 @@ type DataStore struct {
 
 	NewMFATokenFunc        NewMFATokenFunc
 	NewMFATokenFuncInvoked bool
+
+	NewEmailLoginTokenFunc        NewEmailLoginTokenFunc
+	NewEmailLoginTokenFuncInvoked bool
+
+	SessionByEmailLoginTokenFunc        SessionByEmailLoginTokenFunc
+	SessionByEmailLoginTokenFuncInvoked bool
+
+	DeleteEmailLoginTokenFunc        DeleteEmailLoginTokenFunc
+	DeleteEmailLoginTokenFuncInvoked bool
 
 	NewAppConfigFunc        NewAppConfigFunc
 	NewAppConfigFuncInvoked bool
@@ -7368,6 +7383,27 @@ func (s *DataStore) NewMFAToken(ctx context.Context, userID uint) (string, error
 	s.NewMFATokenFuncInvoked = true
 	s.mu.Unlock()
 	return s.NewMFATokenFunc(ctx, userID)
+}
+
+func (s *DataStore) NewEmailLoginToken(ctx context.Context, userID uint) (string, error) {
+	s.mu.Lock()
+	s.NewEmailLoginTokenFuncInvoked = true
+	s.mu.Unlock()
+	return s.NewEmailLoginTokenFunc(ctx, userID)
+}
+
+func (s *DataStore) SessionByEmailLoginToken(ctx context.Context, token string, sessionKeySize int) (*fleet.Session, *fleet.User, error) {
+	s.mu.Lock()
+	s.SessionByEmailLoginTokenFuncInvoked = true
+	s.mu.Unlock()
+	return s.SessionByEmailLoginTokenFunc(ctx, token, sessionKeySize)
+}
+
+func (s *DataStore) DeleteEmailLoginToken(ctx context.Context, token string) error {
+	s.mu.Lock()
+	s.DeleteEmailLoginTokenFuncInvoked = true
+	s.mu.Unlock()
+	return s.DeleteEmailLoginTokenFunc(ctx, token)
 }
 
 func (s *DataStore) NewAppConfig(ctx context.Context, info *fleet.AppConfig) (*fleet.AppConfig, error) {

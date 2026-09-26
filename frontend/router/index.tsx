@@ -21,6 +21,7 @@ import Spinner from "components/Spinner";
 import ConfirmInvitePage from "pages/ConfirmInvitePage";
 import ConfirmSSOInvitePage from "pages/ConfirmSSOInvitePage";
 import MfaPage from "pages/MfaPage";
+import EmailLoginPage from "pages/EmailLoginPage/EmailLoginPage";
 import CoreLayout from "layouts/CoreLayout";
 import DeviceUserSSOErrorPage from "pages/DeviceUserSSOErrorPage";
 import EmailTokenRedirect from "components/EmailTokenRedirect";
@@ -484,6 +485,7 @@ const routes = (
             component={ConfirmSSOInvitePage}
           />
           <Route path="login/mfa/:token" component={MfaPage} />
+          <Route path="login/email" component={EmailLoginPage} />
           <Route path="login/forgot" component={ForgotPasswordPage} />
           <Route path="login/reset" component={ResetPasswordPage} />
           <Route path="login/denied" component={NoAccessPage} />
