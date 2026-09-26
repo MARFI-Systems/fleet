@@ -24,6 +24,27 @@ import (
 	yaml "gopkg.in/yaml.v2"
 )
 
+func TestEmailPasswordlessConfig(t *testing.T) {
+	t.Run("default off", func(t *testing.T) {
+		testutils.SaveEnv(t)
+		os.Clearenv()
+		cmd := &cobra.Command{}
+		cmd.PersistentFlags().StringP("config", "c", "", "Path to a configuration file")
+		cfg := NewManager(cmd).LoadConfig()
+		require.False(t, cfg.Auth.EmailPasswordlessEnabled)
+	})
+
+	t.Run("environment enables", func(t *testing.T) {
+		testutils.SaveEnv(t)
+		os.Clearenv()
+		require.NoError(t, os.Setenv("FLEET_AUTH_EMAIL_PASSWORDLESS_ENABLED", "true"))
+		cmd := &cobra.Command{}
+		cmd.PersistentFlags().StringP("config", "c", "", "Path to a configuration file")
+		cfg := NewManager(cmd).LoadConfig()
+		require.True(t, cfg.Auth.EmailPasswordlessEnabled)
+	})
+}
+
 func TestConfigRoundtrip(t *testing.T) {
 	// This test verifies that a config can be roundtripped through yaml.
 	// Doing so ensures that config_dump will provide the correct config.

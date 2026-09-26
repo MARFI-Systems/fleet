@@ -1,20 +1,38 @@
 import React, { useEffect, useState } from "react";
+import { useQuery } from "react-query";
 import { InjectedRouter } from "react-router";
 
 import AuthenticationFormWrapper from "components/AuthenticationFormWrapper";
 import AuthenticationNav from "components/AuthenticationNav";
 import CustomLink from "components/CustomLink";
+import Spinner from "components/Spinner";
 // @ts-ignore
 import ForgotPasswordForm from "components/forms/ForgotPasswordForm";
 import PATHS from "router/paths";
+import sessionsAPI from "services/entities/sessions";
 import usersAPI from "services/entities/users";
 import formatErrorResponse from "utilities/format_error_response";
 
 interface IForgotPasswordPage {
   router: InjectedRouter;
+  location?: { search: string };
 }
 
-const ForgotPasswordPage = ({ router }: IForgotPasswordPage) => {
+const ForgotPasswordPage = ({ router, location }: IForgotPasswordPage) => {
+  const recoveryLogin =
+    new URLSearchParams(location?.search || "").get("recovery") === "1";
+  const {
+    data: authSettings,
+    isLoading: loadingAuthSettings,
+    isError: authSettingsError,
+  } = useQuery(["ssoSettings"], () => sessionsAPI.ssoSettings());
+  const magicLinkEnabled = !!authSettings?.settings.email_passwordless_enabled;
+
+  useEffect(() => {
+    if (magicLinkEnabled && !recoveryLogin) {
+      router.replace(PATHS.LOGIN);
+    }
+  }, [magicLinkEnabled, recoveryLogin, router]);
   const [email, setEmail] = useState("");
   const [errors, setErrors] = useState<{ [key: string]: string }>({});
   const [isLoading, setIsLoading] = useState(false);
@@ -73,11 +91,28 @@ const ForgotPasswordPage = ({ router }: IForgotPasswordPage) => {
     );
   };
 
+  if (loadingAuthSettings || (magicLinkEnabled && !recoveryLogin)) {
+    return <Spinner />;
+  }
+
+  if (authSettingsError) {
+    return (
+      <AuthenticationFormWrapper header="Sign-in unavailable">
+        <CustomLink url={PATHS.LOGIN} text="Return to sign-in and try again" />
+      </AuthenticationFormWrapper>
+    );
+  }
+
   return (
     <AuthenticationFormWrapper
       header="Reset password"
       headerCta={
-        <AuthenticationNav previousLocation={PATHS.LOGIN} router={router} />
+        <AuthenticationNav
+          previousLocation={
+            recoveryLogin ? `${PATHS.LOGIN}?recovery=1` : PATHS.LOGIN
+          }
+          router={router}
+        />
       }
       className={baseClass}
     >

@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -37,6 +38,7 @@ func TestSessions(t *testing.T) {
 	}{
 		{"Getters", testSessionsGetters},
 		{"MFA", testMFA},
+		{"EmailPasswordless", testEmailPasswordless},
 		{"LastLoginAt", testSessionsLastLoginAt},
 	}
 	for _, c := range cases {
@@ -143,6 +145,105 @@ func testMFA(t *testing.T, ds *Datastore) {
 	require.Error(t, err)
 	require.Nil(t, mfaUser)
 	require.Nil(t, session)
+}
+
+func testEmailPasswordless(t *testing.T, ds *Datastore) {
+	ctx := context.Background()
+	user, err := ds.NewUser(ctx, &fleet.User{
+		Password:   []byte("supersecret"),
+		Email:      "passwordless@example.com",
+		GlobalRole: ptr.String(fleet.RoleObserver),
+	})
+	require.NoError(t, err)
+
+	token, err := ds.NewEmailLoginToken(ctx, user.ID)
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(token, fleet.EmailPasswordlessTokenPrefix))
+
+	// Per-account cooldown suppresses repeated delivery attempts.
+	secondToken, err := ds.NewEmailLoginToken(ctx, user.ID)
+	require.NoError(t, err)
+	require.Empty(t, secondToken)
+
+	// Passwordless tokens cannot be consumed through the MFA-only datastore path.
+	_, _, err = ds.SessionByMFAToken(ctx, token, 8)
+	require.Error(t, err)
+
+	// Eligibility is re-checked at atomic consume time.
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		_, err := q.ExecContext(ctx, "UPDATE users SET sso_enabled = 1 WHERE id = ?", user.ID)
+		return err
+	})
+	_, _, err = ds.SessionByEmailLoginToken(ctx, token, 8)
+	require.Error(t, err)
+
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		_, err := q.ExecContext(ctx, "UPDATE users SET sso_enabled = 0 WHERE id = ?", user.ID)
+		return err
+	})
+	session, loginUser, err := ds.SessionByEmailLoginToken(ctx, token, 8)
+	require.NoError(t, err)
+	require.Equal(t, user.ID, loginUser.ID)
+	require.Equal(t, user.ID, session.UserID)
+
+	// Tokens are single use.
+	_, _, err = ds.SessionByEmailLoginToken(ctx, token, 8)
+	require.Error(t, err)
+
+	// Concurrent redemptions of a passwordless token mint exactly one session.
+	concurrentToken, err := ds.NewEmailLoginToken(ctx, user.ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, concurrentToken)
+	var (
+		wg        sync.WaitGroup
+		mu        sync.Mutex
+		successes int
+	)
+	wg.Add(8)
+	for range 8 {
+		go func() {
+			defer wg.Done()
+			_, _, err := ds.SessionByEmailLoginToken(ctx, concurrentToken, 8)
+			mu.Lock()
+			defer mu.Unlock()
+			if err == nil {
+				successes++
+			}
+		}()
+	}
+	wg.Wait()
+	require.Equal(t, 1, successes)
+
+	// A delivery failure cleanup removes the token and allows a fresh request.
+	freshToken, err := ds.NewEmailLoginToken(ctx, user.ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, freshToken)
+	require.NoError(t, ds.DeleteEmailLoginToken(ctx, freshToken))
+	_, _, err = ds.SessionByEmailLoginToken(ctx, freshToken, 8)
+	require.Error(t, err)
+
+	// Passwordless tokens share the 15-minute verification-token expiry.
+	expiredToken, err := ds.NewEmailLoginToken(ctx, user.ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, expiredToken)
+	ExecAdhocSQL(t, ds, func(q sqlx.ExtContext) error {
+		_, err := q.ExecContext(ctx,
+			"UPDATE verification_tokens SET created_at = NOW() - INTERVAL ? SECOND - INTERVAL 0.5 SECOND WHERE token = ?",
+			fleet.MFALinkTTL.Seconds(), expiredToken)
+		return err
+	})
+	_, _, err = ds.SessionByEmailLoginToken(ctx, expiredToken, 8)
+	require.Error(t, err)
+
+	// Fleet moves deleted users to users_deleted; there is no users.deleted column.
+	deletedToken, err := ds.NewEmailLoginToken(ctx, user.ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, deletedToken)
+	require.NoError(t, ds.DeleteUser(ctx, user.ID))
+	_, _, err = ds.SessionByEmailLoginToken(ctx, deletedToken, 8)
+	require.Error(t, err)
+	_, err = ds.NewEmailLoginToken(ctx, user.ID)
+	require.Error(t, err)
 }
 
 func sessionKeys(sessions []*fleet.Session) []string {

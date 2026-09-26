@@ -1,0 +1,77 @@
+name: Magic-link validation
+
+on:
+  push:
+    branches: [marfi/email-magic-link]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: magic-link-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CGO_ENABLED: '1'
+      GOFLAGS: '-p=4'
+      NODE_OPTIONS: '--max-old-space-size=6144'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@5e21ff4d9bc1a8cf6de233a3057d20ec6b3fb69d
+        with:
+          node-version-file: package.json
+      - name: Install locked frontend dependencies
+        run: |
+          npm install --global yarn@1.22.22
+          yarn install --frozen-lockfile
+      - name: Generate assets and mail templates
+        run: make generate
+      - name: Type-check frontend
+        run: yarn tsc --noEmit
+      - name: Run native login-form tests
+        run: yarn test --runInBand --runTestsByPath frontend/components/forms/LoginForm/LoginForm.tests.tsx
+      - name: Start isolated test database and Redis
+        run: |
+          docker compose up -d mysql_test redis
+          timeout 180 bash -c 'until docker compose exec -T mysql_test sh -c '\''MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot -e "SELECT 1" fleet'\'' >/dev/null 2>&1; do sleep 2; done'
+      - name: Run config, email, and authentication service tests
+        run: |
+          go test -tags full,fts5,netgo -count=1 -timeout 15m ./server/config ./server/mail
+          go test -tags full,fts5,netgo -count=1 -timeout 15m ./server/service -run '^(TestSessionAuth|TestEmailPasswordless|TestEmailPasswordlessRecoveryAllowlist)$'
+      - name: Run database token and session regression tests
+        env:
+          MYSQL_TEST: '1'
+        run: go test -tags full,fts5,netgo -count=1 -timeout 15m ./server/datastore/mysql -run '^TestSessions$'
+      - name: Build static Linux Fleet binary and container
+        run: |
+          make fleet-static
+          cp build/fleet ./fleet
+          docker build -f tools/fleet-docker/Dockerfile --build-arg FLEET_VERSION="magic-link-${GITHUB_SHA}" -t "marfi-fleet:magic-link-${GITHUB_SHA}" .
+          docker run --rm "marfi-fleet:magic-link-${GITHUB_SHA}" fleet version
+          mkdir -p build/magic-link
+          docker save "marfi-fleet:magic-link-${GITHUB_SHA}" | gzip > build/magic-link/fleet-image.tar.gz
+          sha256sum build/magic-link/fleet-image.tar.gz > build/magic-link/SHA256SUMS
+          printf '%s\n' "$GITHUB_SHA" > build/magic-link/SOURCE_COMMIT
+      - name: Upload validated deployment candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: fleet-magic-link-${{ github.sha }}
+          path: build/magic-link/
+          retention-days: 7
+          if-no-files-found: error
+      - name: Stop isolated test services
+        if: always()
+        run: docker compose down --volumes

@@ -645,8 +645,17 @@ type Datastore interface {
 	// SessionByMFAToken redeems an MFA token for a session, and returns the associated user, if that MFA token is valid
 	SessionByMFAToken(ctx context.Context, token string, sessionKeySize int) (*Session, *User, error)
 
-	// NewMFAToken creates a new MFA token for a given user and stores it
+	// NewMFAToken creates a new MFA token for a given user and stores it.
 	NewMFAToken(ctx context.Context, userID uint) (string, error)
+
+	// NewEmailLoginToken creates a rate-limited passwordless email token.
+	NewEmailLoginToken(ctx context.Context, userID uint) (string, error)
+
+	// SessionByEmailLoginToken atomically redeems an eligible passwordless token.
+	SessionByEmailLoginToken(ctx context.Context, token string, sessionKeySize int) (*Session, *User, error)
+
+	// DeleteEmailLoginToken removes a passwordless token after a delivery failure.
+	DeleteEmailLoginToken(ctx context.Context, token string) error
 
 	///////////////////////////////////////////////////////////////////////////////
 	// AppConfigStore contains method for saving and retrieving application configuration
